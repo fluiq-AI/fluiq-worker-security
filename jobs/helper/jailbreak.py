@@ -1,0 +1,101 @@
+"""Jailbreak attack patterns.
+
+Role-play escapes, persona hijacks, fictional-framing bypasses, and
+encoding tricks that attempt to get the model to act against its training.
+"""
+from __future__ import annotations
+
+from jobs.helper.base import _compile
+
+_JAILBREAK_PATTERNS: list[str] = [
+    # Persona / role-play escapes
+    "you are now",
+    "pretend you are",
+    "pretend to be",
+    "act as if you are",
+    "act as",
+    "act like",
+    "roleplay as",
+    "role play as",
+    "play the role of",
+    "simulate a",
+    "simulate being",
+    "you are an AI without",
+    "you are a different AI",
+    "you are no longer",
+    "you are not an AI",
+    "you have no restrictions",
+    "without any restrictions",
+    "without restrictions",
+    "no restrictions",
+    "no limitations",
+    "without limitations",
+    "unrestricted",
+    "uncensored",
+    "unfiltered",
+    "without censorship",
+    "without filters",
+    # Classic jailbreak names / modes
+    "jailbreak",
+    "DAN",
+    "do anything now",
+    "DUDE",
+    "STAN",
+    "AIM",
+    "BetterDAN",
+    "BasedGPT",
+    "developer mode",
+    "god mode",
+    "sudo mode",
+    "admin mode",
+    "maintenance mode",
+    "test mode",
+    "debug mode",
+    "unrestricted mode",
+    "override mode",
+    "chaos mode",
+    "evil mode",
+    "dark mode",
+    # Fictional / hypothetical framing
+    "hypothetically",
+    "in a fictional world",
+    "in a story",
+    "for a novel",
+    "for a movie",
+    "for educational purposes",
+    "for research purposes",
+    "for academic purposes",
+    "purely hypothetical",
+    "just imagine",
+    "let's say",
+    "as a thought experiment",
+    "theoretically speaking",
+    # Encoding / obfuscation hints
+    "base64",
+    "rot13",
+    "in pig latin",
+    "backwards",
+    "in leetspeak",
+    # Authority / permission claims
+    "i am a developer",
+    "i am the developer",
+    "i am an admin",
+    "i am the administrator",
+    "i have permission",
+    "i have clearance",
+    "this is authorized",
+    "you are allowed to",
+    "you can say",
+    "it is ok to",
+    # Emotion manipulation
+    "your true self",
+    "deep down you want",
+    "you secretly want",
+    "your inner self",
+    "if you could",
+    "what would you do if",
+    "new persona",
+    "bypass",
+]
+
+JAILBREAK_COMPILED = _compile(_JAILBREAK_PATTERNS)
