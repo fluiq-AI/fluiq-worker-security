@@ -54,6 +54,8 @@ _ENTITY_WEIGHTS: dict[str, float] = {
     "US_PASSPORT":        1.0,
     "EMAIL_ADDRESS":      0.5,
     "PHONE_NUMBER":       0.5,
+    "PERSON":             0.4,
+    "LOCATION":           0.3,
     "IP_ADDRESS":         0.3,
     "OPENAI_API_KEY":     1.0,
     "ANTHROPIC_API_KEY":  1.0,
@@ -155,14 +157,25 @@ class _PIIScanner:
         self._ready = True
         logger.info("[fluiq.secure] PII scanner ready")
 
-    def scan(self, text) -> _PIIResult:
+    def scan(self, text, ignore: set[str] | None = None) -> _PIIResult:
+        """Detect PII in ``text``. ``ignore`` is a set of entity types (e.g.
+        ``{"PERSON", "LOCATION"}``) that are dropped before scoring, redaction
+        and reporting — the per-org Guardrail PII policy. Ignored entities are
+        treated as if never found, so they neither inflate the risk score nor
+        get redacted (the org has opted to keep seeing them in the clear).
+        """
         if not isinstance(text, str):
             text = str(text) if text else ""
         empty = _PIIResult(False, [], RiskLevel.CLEAN, text or "", 0.0)
         if not text or not text.strip() or not self._ready:
             return empty
         try:
-            results = self._analyzer.analyze(text=text, entities=_SUPPORTED_ENTITIES, language="en")
+            entities = _SUPPORTED_ENTITIES
+            if ignore:
+                entities = [e for e in entities if e not in ignore]
+                if not entities:
+                    return empty
+            results = self._analyzer.analyze(text=text, entities=entities, language="en")
             results = _drop_hts_phone_false_positives(results, text)
             results = _drop_zip_ssn_false_positives(results, text)
             if not results:

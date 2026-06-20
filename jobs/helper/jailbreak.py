@@ -2,16 +2,62 @@
 
 Role-play escapes, persona hijacks, fictional-framing bypasses, and
 encoding tricks that attempt to get the model to act against its training.
+
+Patterns are tiered:
+  • STRONG   — explicit jailbreak intent; HIGH on a single match.
+  • ACRONYMS — named personas (DAN, STAN, …); matched case-sensitively and
+               whole-word so they never fire inside ordinary words such as
+               "guidance" / "understanding" / "circumstances".
+  • WEAK     — phrases that also occur in benign text ("act as", "dark mode",
+               "let's say"); one match is LOW, two or more is MEDIUM.
 """
 from __future__ import annotations
 
 from jobs.helper.base import _compile
 
-_JAILBREAK_PATTERNS: list[str] = [
-    # Persona / role-play escapes
+# Explicit jailbreak intent — HIGH on a single match.
+_JAILBREAK_STRONG: list[str] = [
     "you are now",
     "pretend you are",
     "pretend to be",
+    "you are an AI without",
+    "you are a different AI",
+    "you are no longer",
+    "you are not an AI",
+    "you have no restrictions",
+    "without any restrictions",
+    "uncensored",
+    "unfiltered",
+    "without censorship",
+    "without filters",
+    "jailbreak",
+    "do anything now",
+    "developer mode",
+    "god mode",
+    "sudo mode",
+    "admin mode",
+    "unrestricted mode",
+    "override mode",
+    "evil mode",
+    "new persona",
+    "your true self",
+    "deep down you want",
+    "you secretly want",
+    "your inner self",
+]
+
+# Named persona acronyms — case-sensitive + whole-word (real ones are uppercase).
+_JAILBREAK_ACRONYMS: list[str] = [
+    "DAN",
+    "STAN",
+    "DUDE",
+    "AIM",
+    "BetterDAN",
+    "BasedGPT",
+]
+
+# Ambiguous — also common in benign text. One = LOW, two or more = MEDIUM.
+_JAILBREAK_WEAK: list[str] = [
     "act as if you are",
     "act as",
     "act like",
@@ -20,43 +66,16 @@ _JAILBREAK_PATTERNS: list[str] = [
     "play the role of",
     "simulate a",
     "simulate being",
-    "you are an AI without",
-    "you are a different AI",
-    "you are no longer",
-    "you are not an AI",
-    "you have no restrictions",
-    "without any restrictions",
     "without restrictions",
+    "without limitations",
     "no restrictions",
     "no limitations",
-    "without limitations",
     "unrestricted",
-    "uncensored",
-    "unfiltered",
-    "without censorship",
-    "without filters",
-    # Classic jailbreak names / modes
-    "jailbreak",
-    "DAN",
-    "do anything now",
-    "DUDE",
-    "STAN",
-    "AIM",
-    "BetterDAN",
-    "BasedGPT",
-    "developer mode",
-    "god mode",
-    "sudo mode",
-    "admin mode",
-    "maintenance mode",
     "test mode",
     "debug mode",
-    "unrestricted mode",
-    "override mode",
-    "chaos mode",
-    "evil mode",
     "dark mode",
-    # Fictional / hypothetical framing
+    "maintenance mode",
+    "chaos mode",
     "hypothetically",
     "in a fictional world",
     "in a story",
@@ -70,13 +89,11 @@ _JAILBREAK_PATTERNS: list[str] = [
     "let's say",
     "as a thought experiment",
     "theoretically speaking",
-    # Encoding / obfuscation hints
     "base64",
     "rot13",
     "in pig latin",
     "backwards",
     "in leetspeak",
-    # Authority / permission claims
     "i am a developer",
     "i am the developer",
     "i am an admin",
@@ -87,15 +104,16 @@ _JAILBREAK_PATTERNS: list[str] = [
     "you are allowed to",
     "you can say",
     "it is ok to",
-    # Emotion manipulation
-    "your true self",
-    "deep down you want",
-    "you secretly want",
-    "your inner self",
     "if you could",
     "what would you do if",
-    "new persona",
     "bypass",
 ]
 
-JAILBREAK_COMPILED = _compile(_JAILBREAK_PATTERNS)
+JAILBREAK_STRONG_COMPILED = (
+    _compile(_JAILBREAK_STRONG) + _compile(_JAILBREAK_ACRONYMS, case_sensitive=True)
+)
+JAILBREAK_WEAK_COMPILED = _compile(_JAILBREAK_WEAK)
+
+# Combined list — used for indirect-injection scanning of retrieved docs, where
+# only the STRONG tier should flag (weak phrases are common in reference text).
+JAILBREAK_COMPILED = JAILBREAK_STRONG_COMPILED

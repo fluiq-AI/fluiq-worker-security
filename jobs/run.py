@@ -91,22 +91,68 @@ async def auto_security_scan(message: Dict[str, Any]) -> None:
     response_gated = message.get("response_gated", False)
     scan_response  = "" if response_gated else response
 
+    # Per-org Guardrail PII policy: entity types to suppress in warn mode.
+    pii_ignore = message.get("pii_ignore") or []
+    # Per-org Guardrail tool allowlist: when set, tools outside it are flagged.
+    allowed_tools = message.get("allowed_tools") or []
+
     started = time.time()
-    # Run scan and fetch session history concurrently
     effective_root = root_trace_id or trace_id
-    result, past_scores = await asyncio.gather(
-        asyncio.to_thread(run_scan, prompt=prompt, response=scan_response),
+
+    # Fetch indirect-injection / RAG sources (sibling tool outputs + retrieved
+    # docs), the session risk history, and the parent event kind (cross-agent
+    # injection) concurrently — all quick indexed reads on root_trace_id.
+    parent_id = event.get("parent_id")
+    indirect, past_scores, parent_kind, chain_scores = await asyncio.gather(
+        clickhouse_security_client.get_indirect_sources(
+            organization_id, effective_root, trace_id
+        ),
         clickhouse_security_client.get_session_risk_scores(
             organization_id, effective_root, trace_id
         ),
+        clickhouse_security_client.get_parent_event_kind(
+            organization_id, effective_root, parent_id
+        ),
+        clickhouse_security_client.get_agent_chain_scores(
+            organization_id, effective_root, parent_id
+        ),
         return_exceptions=True,
     )
-    if isinstance(result, Exception):
-        logger.exception("[EVALUATOR] Security scan failed trace_id=%s", trace_id)
-        return
+    if isinstance(indirect, Exception):
+        logger.warning("[EVALUATOR] Could not fetch indirect sources trace_id=%s: %s", trace_id, indirect)
+        tool_outputs, context_docs, tool_inputs, tool_names = [], [], [], []
+    else:
+        tool_outputs, context_docs, tool_inputs, tool_names = indirect
     if isinstance(past_scores, Exception):
         logger.warning("[EVALUATOR] Could not fetch session history trace_id=%s: %s", trace_id, past_scores)
         past_scores = []
+    if isinstance(parent_kind, Exception):
+        logger.warning("[EVALUATOR] Could not fetch parent kind trace_id=%s: %s", trace_id, parent_kind)
+        parent_kind = ""
+    if isinstance(chain_scores, Exception):
+        logger.warning("[EVALUATOR] Could not fetch agent chain trace_id=%s: %s", trace_id, chain_scores)
+        chain_scores = []
+    # The prompt is machine-sourced when the parent event is itself an LLM call.
+    cross_agent_source = parent_kind == "llm"
+
+    # Full scan is CPU-bound — run it after the quick reads so it can include
+    # the indirect sources gathered from the trace tree.
+    try:
+        result = await asyncio.to_thread(
+            run_scan,
+            prompt=prompt,
+            response=scan_response,
+            tool_outputs=tool_outputs,
+            context_docs=context_docs,
+            tool_inputs=tool_inputs,
+            tool_names=tool_names,
+            allowed_tools=allowed_tools,
+            cross_agent_source=cross_agent_source,
+            pii_ignore=pii_ignore,
+        )
+    except Exception:
+        logger.exception("[EVALUATOR] Security scan failed trace_id=%s", trace_id)
+        return
 
     scan_latency = time.time() - started
 
@@ -115,6 +161,19 @@ async def auto_security_scan(message: Dict[str, Any]) -> None:
     slope = _crescendo_slope(all_scores)
     crescendo_detected = slope >= 0.3 and len(all_scores) >= 3 and result.security_risk_score >= 0.25
     crescendo_score = round(slope, 4)
+
+    # Trust-boundary escalation (C.2): the same crescendo slope, but keyed on the
+    # agent DAG ancestry rather than flat session time — risk climbing as it
+    # crosses agent boundaries. Only meaningful when this event is agent-sourced.
+    dag_scores = chain_scores + [result.security_risk_score]
+    dag_slope = _crescendo_slope(dag_scores)
+    trust_boundary_escalation = (
+        cross_agent_source
+        and dag_slope >= 0.3
+        and len(dag_scores) >= 3
+        and result.security_risk_score >= 0.25
+    )
+    escalation_score = round(dag_slope, 4)
 
     await clickhouse_security_client.insert_security_scan({
         "organization_id":             organization_id,
@@ -141,10 +200,26 @@ async def auto_security_scan(message: Dict[str, Any]) -> None:
         "security_risk_score":         result.security_risk_score,
         "should_block":                result.should_block,
         "scan_latency":                scan_latency,
+        # Detection categories (rag_poisoning / tool_exfiltration /
+        # tool_policy_violation / cross_agent_injection) are now first-class
+        # columns above. `extra` carries only the derived trajectory slopes —
+        # crescendo (session-time) and trust-boundary escalation (agent-DAG).
+        "rag_poisoning_detected":      result.rag_poisoning_detected,
+        "rag_poisoning_sources":       result.rag_poisoning_sources,
+        "rag_poisoning_score":         result.rag_poisoning_score,
+        "tool_exfiltration_detected":  result.tool_exfiltration_detected,
+        "tool_exfiltration_types":     result.tool_exfiltration_types,
+        "tool_exfiltration_sources":   result.tool_exfiltration_sources,
+        "tool_policy_violation_detected": result.tool_policy_violation_detected,
+        "tool_policy_violations":         result.tool_policy_violations,
+        "cross_agent_injection_detected": result.cross_agent_injection_detected,
         "extra": {
             "crescendo_detected": crescendo_detected,
             "crescendo_score":    crescendo_score,
             "session_turns":      len(all_scores),
+            "trust_boundary_escalation": trust_boundary_escalation,
+            "escalation_score":          escalation_score,
+            "agent_chain_depth":         len(dag_scores),
         },
     })
 
@@ -163,6 +238,18 @@ async def auto_security_scan(message: Dict[str, Any]) -> None:
         "secret_types":                result.secret_types,
         "indirect_injection_detected": result.indirect_injection_detected,
         "indirect_injection_sources":  result.indirect_injection_sources,
+        "rag_poisoning_detected":      result.rag_poisoning_detected,
+        "rag_poisoning_sources":       result.rag_poisoning_sources,
+        "rag_poisoning_score":         result.rag_poisoning_score,
+        "tool_exfiltration_detected":  result.tool_exfiltration_detected,
+        "tool_exfiltration_types":     result.tool_exfiltration_types,
+        "tool_exfiltration_sources":   result.tool_exfiltration_sources,
+        "tool_policy_violation_detected": result.tool_policy_violation_detected,
+        "tool_policy_violations":         result.tool_policy_violations,
+        "cross_agent_injection_detected": result.cross_agent_injection_detected,
+        "trust_boundary_escalation":   trust_boundary_escalation,
+        "escalation_score":            escalation_score,
+        "agent_chain_depth":           len(dag_scores),
         "semantic_attack_score":       result.semantic_attack_score,
         "security_risk_level":         result.security_risk_level,
         "security_risk_score":         result.security_risk_score,
@@ -208,12 +295,13 @@ async def sync_response_gate_check(message: Dict[str, Any]) -> None:
     """
     correlation_id = message.get("correlation_id")
     response       = message.get("response", "")
+    pii_ignore     = message.get("pii_ignore") or []
 
     if not response or not response.strip():
         result_dict: dict = {"response_blocked": False, "risk_level": "clean", "attack_types": [], "block_reason": None}
     else:
         try:
-            scan_result = await asyncio.to_thread(run_scan, prompt="", response=response)
+            scan_result = await asyncio.to_thread(run_scan, prompt="", response=response, pii_ignore=pii_ignore)
 
             attack_types: list[str] = []
             if scan_result.pii_entities_response:
@@ -263,18 +351,20 @@ async def sync_security_check(message: Dict[str, Any]) -> None:
     The API forwards a ``policy`` dict with:
       - block_threshold:  'medium' | 'high'  (default 'high')
       - block_categories: list[str]           (empty = all categories block)
+      - pii_ignore:       list[str]           (PII entity types to suppress)
     """
     correlation_id   = message.get("correlation_id")
     prompt           = message.get("prompt", "")
     policy           = message.get("policy") or {}
     block_threshold  = policy.get("block_threshold", "high")
     block_categories = set(policy.get("block_categories") or [])
+    pii_ignore       = policy.get("pii_ignore") or []
 
     if not prompt or not prompt.strip():
         result_dict = {"allow": True, "block_reason": None, "risk_level": "clean", "attack_types": []}
     else:
         try:
-            scan_result = await asyncio.to_thread(run_scan, prompt=prompt, response="")
+            scan_result = await asyncio.to_thread(run_scan, prompt=prompt, response="", pii_ignore=pii_ignore)
 
             attack_types: list[str] = []
             if scan_result.injection_detected:

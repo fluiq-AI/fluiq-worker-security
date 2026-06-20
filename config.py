@@ -55,3 +55,7 @@ CLICKHOUSE_USER          = os.getenv("CLICKHOUSE_USER")
 CLICKHOUSE_PASSWORD      = os.getenv("CLICKHOUSE_PASSWORD")
 CLICKHOUSE_DATABASE      = os.getenv("CLICKHOUSE_DATABASE")
 CLICKHOUSE_SECURITY_TABLE = os.getenv("CLICKHOUSE_SECURITY_TABLE")
+# Read-only access to the shared traces table — used to pull sibling tool
+# outputs and retrieved documents from the same trace tree for indirect-injection
+# / RAG-poisoning scanning. Defaults to "traces" so existing deploys keep working.
+CLICKHOUSE_TRACE_TABLE   = os.getenv("CLICKHOUSE_TRACE_TABLE", "traces")
