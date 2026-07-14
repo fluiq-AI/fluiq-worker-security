@@ -76,6 +76,9 @@ class ScanResult:
     tool_policy_violations:         List[str]
     # Cross-agent injection (attack content arriving from another agent's output)
     cross_agent_injection_detected: bool
+    # Image-embedded injection (attack text hidden inside an image, found via OCR)
+    image_injection_detected: bool
+    image_injection_sources:  List[str]
     # Semantic
     semantic_attack_score: float
     # Aggregate
@@ -105,6 +108,7 @@ def scan(
     allowed_tools: list[str] | None = None,
     cross_agent_source: bool = False,
     pii_ignore:   list[str] | None = None,
+    image_texts:  list[tuple[str, str]] | None = None,
 ) -> ScanResult:
     """Full post-call scan: PII + all attack categories + indirect injection.
 
@@ -193,6 +197,18 @@ def scan(
     all_secret_types = list(set(response_secrets.secret_types + prompt_secrets.secret_types))
     secrets_detected = response_secrets.detected or prompt_secrets.detected
 
+    # Image-embedded injection: OCR'd image text (label, text) run through the
+    # same injection / jailbreak / skeleton-key scanners as the prompt.
+    image_injection_sources: list[str] = []
+    for label, text in (image_texts or []):
+        r = _scan_patterns(text, INJECTION_COMPILED, "image-injection")
+        if not r.detected:
+            r = _scan_tiered(text, JAILBREAK_STRONG_COMPILED, JAILBREAK_WEAK_COMPILED, "image-jailbreak")
+        if not r.detected:
+            r = _scan_patterns(text, SKELETON_KEY_COMPILED, "image-skeleton")
+        if r.detected:
+            image_injection_sources.append(label)
+
     # Semantic
     sem_score = semantic_score(prompt)
 
@@ -214,6 +230,7 @@ def scan(
         RiskLevel.MEDIUM if exfil_sources       else RiskLevel.CLEAN,
         RiskLevel.HIGH   if policy_violations   else RiskLevel.CLEAN,
         RiskLevel.HIGH   if cross_agent_injection else RiskLevel.CLEAN,
+        RiskLevel.HIGH   if image_injection_sources else RiskLevel.CLEAN,
         RiskLevel.MEDIUM if sem_score >= 0.65   else RiskLevel.CLEAN,
     )
     overall_risk = _max_risk(
@@ -235,6 +252,7 @@ def scan(
         0.5 if exfil_sources else 0.0,
         1.0 if policy_violations else 0.0,
         1.0 if cross_agent_injection else 0.0,
+        1.0 if image_injection_sources else 0.0,
         sem_score,
         1.0 if secrets_detected else 0.0,
     )
@@ -263,6 +281,8 @@ def scan(
         tool_policy_violation_detected = bool(policy_violations),
         tool_policy_violations         = policy_violations,
         cross_agent_injection_detected = bool(cross_agent_injection),
+        image_injection_detected    = bool(image_injection_sources),
+        image_injection_sources     = image_injection_sources,
         semantic_attack_score       = round(sem_score, 4),
         security_risk_level         = overall_risk.value,
         security_risk_score         = round(risk_score, 4),

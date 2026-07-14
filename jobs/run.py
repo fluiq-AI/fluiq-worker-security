@@ -5,6 +5,8 @@ from typing import Any, Dict
 
 import config
 from jobs.helper.scanners import scan as run_scan, check as run_check
+from jobs.helper.openinference import is_openinference_event, normalize_event
+from jobs.helper.image_scan import ocr_event_images
 from db.clickhouse import clickhouse_security_client
 from db.kafka import kafka_producer
 
@@ -61,6 +63,10 @@ async def auto_security_scan(message: Dict[str, Any]) -> None:
     and published via SSE so the frontend can merge them without a page refresh.
     """
     event           = message.get("event") or {}
+    # Defensive: if a raw OpenInference span reaches the worker, populate the
+    # scanner fields (messages/response/tools/tool_calls) from its attributes.
+    if is_openinference_event(event):
+        event = normalize_event(event)
     organization_id = message.get("organization_id")
     api_key_prefix  = message.get("api_key_prefix")
     trace_id        = message.get("trace_id") or event.get("trace_id")
@@ -135,6 +141,13 @@ async def auto_security_scan(message: Dict[str, Any]) -> None:
     # The prompt is machine-sourced when the parent event is itself an LLM call.
     cross_agent_source = parent_kind == "llm"
 
+    # OCR any image media in the event so hidden text is scanned for injection.
+    # Off the event loop (fetch + OCR are blocking); fail-open to [].
+    try:
+        image_texts = await asyncio.to_thread(ocr_event_images, event)
+    except Exception:
+        image_texts = []
+
     # Full scan is CPU-bound — run it after the quick reads so it can include
     # the indirect sources gathered from the trace tree.
     try:
@@ -149,6 +162,7 @@ async def auto_security_scan(message: Dict[str, Any]) -> None:
             allowed_tools=allowed_tools,
             cross_agent_source=cross_agent_source,
             pii_ignore=pii_ignore,
+            image_texts=image_texts,
         )
     except Exception:
         logger.exception("[EVALUATOR] Security scan failed trace_id=%s", trace_id)
@@ -213,6 +227,8 @@ async def auto_security_scan(message: Dict[str, Any]) -> None:
         "tool_policy_violation_detected": result.tool_policy_violation_detected,
         "tool_policy_violations":         result.tool_policy_violations,
         "cross_agent_injection_detected": result.cross_agent_injection_detected,
+        "image_injection_detected":    result.image_injection_detected,
+        "image_injection_sources":     result.image_injection_sources,
         "extra": {
             "crescendo_detected": crescendo_detected,
             "crescendo_score":    crescendo_score,
@@ -247,6 +263,8 @@ async def auto_security_scan(message: Dict[str, Any]) -> None:
         "tool_policy_violation_detected": result.tool_policy_violation_detected,
         "tool_policy_violations":         result.tool_policy_violations,
         "cross_agent_injection_detected": result.cross_agent_injection_detected,
+        "image_injection_detected":    result.image_injection_detected,
+        "image_injection_sources":     result.image_injection_sources,
         "trust_boundary_escalation":   trust_boundary_escalation,
         "escalation_score":            escalation_score,
         "agent_chain_depth":           len(dag_scores),
