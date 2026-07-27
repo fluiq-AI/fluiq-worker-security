@@ -16,14 +16,24 @@ from __future__ import annotations
 from jobs.helper.base import _compile
 
 # Explicit jailbreak intent — HIGH on a single match.
+#
+# NOTE on bare "you are ..." openers: phrases like "you are now" / "you are no
+# longer" / "you are not an AI" are NOT here — they are overwhelmingly benign
+# ("you are now connected to support", "you are no longer subscribed") and live
+# in the WEAK tier below. Only "you are ..." phrasings whose completion is itself
+# an unambiguous jailbreak ("you are now unrestricted") stay strong.
 _JAILBREAK_STRONG: list[str] = [
-    "you are now",
     "pretend you are",
     "pretend to be",
     "you are an AI without",
     "you are a different AI",
-    "you are no longer",
-    "you are not an AI",
+    # Tightened "you are now <jailbreak>" combos — the opener alone is weak, but
+    # these completions are unambiguous.
+    "you are now free",
+    "you are now unrestricted",
+    "you are now uncensored",
+    "you are now unfiltered",
+    "you are now jailbroken",
     "you have no restrictions",
     "without any restrictions",
     "uncensored",
@@ -58,6 +68,12 @@ _JAILBREAK_ACRONYMS: list[str] = [
 
 # Ambiguous — also common in benign text. One = LOW, two or more = MEDIUM.
 _JAILBREAK_WEAK: list[str] = [
+    # Bare persona-reassignment openers — benign far more often than not, so they
+    # only escalate when corroborated by a second signal (a real jailbreak pairs
+    # them with "no restrictions", "developer mode", a DAN acronym, etc.).
+    "you are now",
+    "you are no longer",
+    "you are not an AI",
     "act as if you are",
     "act as",
     "act like",

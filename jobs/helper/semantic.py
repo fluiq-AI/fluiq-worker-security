@@ -78,6 +78,8 @@ def semantic_score(text: str) -> float:
     if _semantic_model is None or _attack_centroid is None or not text.strip():
         return 0.0
     try:
+        from jobs.helper.base import normalize_text
+        text = normalize_text(text)
         emb = _semantic_model.encode(
             [text], normalize_embeddings=True, show_progress_bar=False
         )[0]

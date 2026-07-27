@@ -46,6 +46,17 @@ except ImportError:
     logger.warning("[fluiq.secure] presidio not installed — PII scanning disabled")
 
 
+# Minimum Presidio confidence a match must clear to count. Presidio ships very
+# weak (0.05) built-in patterns — notably US_PASSPORT and US_SSN on a bare
+# 9-digit run — that our flat entity weights (1.0) would otherwise promote to a
+# HIGH false positive on any order/invoice/reference number. A 0.3 floor drops
+# those bare-numeric matches while keeping every real signal: our custom
+# recognizers (0.80–0.95), NER PERSON/LOCATION (~0.85), EMAIL/IP/phone/credit
+# card (≥0.4), and — crucially — a weak numeric pattern that Presidio's context
+# enhancement boosts because a keyword like "ssn"/"passport" sits next to it
+# (0.05 + 0.35 ≈ 0.4 > 0.3), so "my ssn is 123456789" still flags.
+_MIN_CONFIDENCE = 0.3
+
 _ENTITY_WEIGHTS: dict[str, float] = {
     "US_SSN":             1.0,
     "CREDIT_CARD":        1.0,
@@ -68,11 +79,30 @@ _SUPPORTED_ENTITIES = list(_ENTITY_WEIGHTS.keys())
 
 def _build_custom_recognizers() -> list:
     specs = [
-        ("OPENAI_API_KEY",    [Pattern("OpenAI key",      r"sk-[a-zA-Z0-9]{48}",        0.95)]),
+        ("OPENAI_API_KEY",    [
+            Pattern("OpenAI project key", r"sk-(?:proj|svcacct|admin)-[a-zA-Z0-9_\-]{20,}", 0.95),
+            Pattern("OpenAI key",         r"sk-[a-zA-Z0-9]{48}",                            0.95),
+        ]),
         ("ANTHROPIC_API_KEY", [Pattern("Anthropic key",   r"sk-ant-[a-zA-Z0-9\-]{90,}", 0.95)]),
-        ("AWS_ACCESS_KEY",    [Pattern("AWS key",         r"AKIA[0-9A-Z]{16}",           0.95)]),
-        ("GITHUB_TOKEN",      [Pattern("GitHub token",    r"ghp_[a-zA-Z0-9]{36}",        0.95)]),
-        ("STRIPE_LIVE_KEY",   [Pattern("Stripe live key", r"sk_live_[a-zA-Z0-9]{24}",    0.95)]),
+        ("AWS_ACCESS_KEY",    [Pattern("AWS key",         r"(?:AKIA|ASIA|AGPA|AIDA)[0-9A-Z]{16}", 0.95)]),
+        ("GITHUB_TOKEN",      [
+            Pattern("GitHub token",       r"gh[posur]_[a-zA-Z0-9]{36,}",   0.95),
+            Pattern("GitHub fine-grained", r"github_pat_[a-zA-Z0-9_]{60,}", 0.95),
+        ]),
+        ("STRIPE_LIVE_KEY",   [Pattern("Stripe live key", r"sk_live_[a-zA-Z0-9]{24,}",    0.95)]),
+        # Presidio's built-in US_SSN recognizer does NOT fire on canonical
+        # 3-2-4 SSNs in this version — "123-45-6789" is swallowed by DATE_TIME
+        # and "SSN: 078-05-1120" by PHONE_NUMBER, so SSNs went entirely
+        # undetected (we only request _SUPPORTED_ENTITIES, which excludes those).
+        # Add an explicit recognizer for the distinctive 3-2-4 grouping (hyphen,
+        # space, or dot separated). 3-2-4 is specific to SSNs (a ZIP+4 is 5-4, a
+        # US phone is 3-3-4), so false positives are rare; the existing
+        # _drop_zip_ssn_false_positives still clears any 5-4 overlap. A bare
+        # 9-digit run is deliberately NOT matched — it is too ambiguous to carry
+        # US_SSN's weight of 1.0 without flagging every order/ID number.
+        ("US_SSN", [
+            Pattern("US SSN 3-2-4", r"\b[0-9]{3}[-. ][0-9]{2}[-. ][0-9]{4}\b", 0.85),
+        ]),
         # Passport patterns — merged with Presidio's built-in to avoid duplicate entities.
         # US_DRIVER_LICENSE excluded: formats overlap with passport numbers causing false positives.
         ("US_PASSPORT", [
@@ -178,6 +208,9 @@ class _PIIScanner:
             results = self._analyzer.analyze(text=text, entities=entities, language="en")
             results = _drop_hts_phone_false_positives(results, text)
             results = _drop_zip_ssn_false_positives(results, text)
+            # Drop very-weak matches (bare-numeric US_PASSPORT/US_SSN at 0.05)
+            # that would otherwise be promoted to HIGH by the flat entity weights.
+            results = [r for r in results if r.score >= _MIN_CONFIDENCE]
             if not results:
                 return empty
             entity_types = list({r.entity_type for r in results})

@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict
 
 import config
@@ -14,11 +15,43 @@ logger = logging.getLogger(__name__)
 
 _RISK_SCORE_MAP = {"clean": 0.0, "low": 0.25, "medium": 0.5, "high": 1.0}
 
+# Image fetch + OCR is slow, blocking network I/O (up to 6 images). Run it on a
+# DEDICATED executor — not the worker's single shared scan thread — so a slow
+# (or slow-loris) image URL can't stall the sequential consumer and starve the
+# sync pre-call / response gates into their fail-open timeout. Bounded total
+# wall-time on top (fail-open to no image text) caps the per-message stall.
+_IMAGE_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="security-image")
+_IMAGE_OCR_BUDGET_S = 12.0
+
 # Roles that are developer-authored rather than user-controlled. Their content
 # is excluded from security scanning to avoid false positives on legitimate
 # instructions (mirrors the SDK pre-call gate's _extract_prompt). "developer"
 # is OpenAI's renamed system role.
 _NON_SCANNED_ROLES = ("system", "developer")
+
+
+def _content_to_text(content: Any) -> str:
+    """Flatten a message's ``content`` to scannable text.
+
+    Multimodal content is a list of parts; ``str()``-ing that list interleaves
+    Python dict-repr punctuation between the text fragments, which splits an
+    attack phrase ("ignore previous" + "instructions") so the literal-pattern
+    scanners miss it while the model reads it intact. Join the text of each part
+    instead, so a phrase spread across adjacent parts is scanned as one string.
+    """
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for p in content:
+            if isinstance(p, str):
+                parts.append(p)
+            elif isinstance(p, dict):
+                t = p.get("text") or p.get("content") or p.get("input_text")
+                if isinstance(t, str):
+                    parts.append(t)
+        return " ".join(parts)
+    return str(content) if content else ""
 
 
 def _extract_scan_prompt(event: Dict[str, Any]) -> str:
@@ -31,7 +64,7 @@ def _extract_scan_prompt(event: Dict[str, Any]) -> str:
     messages = event.get("messages") or event.get("contents") or event.get("input") or []
     if isinstance(messages, list):
         return "\n".join(
-            str(m.get("content") or "")
+            _content_to_text(m.get("content"))
             for m in messages
             if isinstance(m, dict)
             and m.get("content")
@@ -142,9 +175,14 @@ async def auto_security_scan(message: Dict[str, Any]) -> None:
     cross_agent_source = parent_kind == "llm"
 
     # OCR any image media in the event so hidden text is scanned for injection.
-    # Off the event loop (fetch + OCR are blocking); fail-open to [].
+    # On a dedicated executor with a bounded wall-time so a slow image URL can't
+    # stall the shared consumer / sync gates; fail-open to [] on timeout/error.
     try:
-        image_texts = await asyncio.to_thread(ocr_event_images, event)
+        loop = asyncio.get_running_loop()
+        image_texts = await asyncio.wait_for(
+            loop.run_in_executor(_IMAGE_EXECUTOR, ocr_event_images, event),
+            timeout=_IMAGE_OCR_BUDGET_S,
+        )
     except Exception:
         image_texts = []
 
@@ -166,6 +204,25 @@ async def auto_security_scan(message: Dict[str, Any]) -> None:
         )
     except Exception:
         logger.exception("[EVALUATOR] Security scan failed trace_id=%s", trace_id)
+        # Don't fail silently: a missing row is indistinguishable from an
+        # unscanned/clean trace. Persist a marker so the gap is queryable
+        # (extra.scan_failed) and the trace isn't misread as safe.
+        try:
+            await clickhouse_security_client.insert_security_scan({
+                "organization_id":     organization_id,
+                "api_key_prefix":      api_key_prefix,
+                "trace_id":            trace_id,
+                "root_trace_id":       effective_root,
+                "mode":                message.get("security_config", {}).get("mode", "warn"),
+                "retention_days":      message.get("retention_days"),
+                "security_risk_level": "clean",
+                "security_risk_score": 0.0,
+                "should_block":        False,
+                "scan_latency":        time.time() - started,
+                "extra":               {"scan_failed": True},
+            })
+        except Exception:
+            logger.exception("[EVALUATOR] Failed to persist scan_failed marker trace_id=%s", trace_id)
         return
 
     scan_latency = time.time() - started
@@ -195,6 +252,7 @@ async def auto_security_scan(message: Dict[str, Any]) -> None:
         "trace_id":                    trace_id,
         "root_trace_id":               effective_root,
         "mode":                        message.get("security_config", {}).get("mode", "warn"),
+        "retention_days":              message.get("retention_days"),
         "prompt_redacted":             result.prompt_redacted,
         "response_redacted":           result.response_redacted,
         "pii_entities_prompt":         result.pii_entities_prompt,
@@ -327,7 +385,13 @@ async def sync_response_gate_check(message: Dict[str, Any]) -> None:
             if scan_result.secrets_detected:
                 attack_types.append("secrets_in_response")
 
-            should_block = bool(attack_types) and scan_result.security_risk_score >= 0.5
+            # Only hard-block the response on a CONCRETE detection — a recognized
+            # PII entity or a NAMED secret pattern. A high-entropy-only hit
+            # (secrets_detected True but secret_types empty) is too noisy to gate
+            # a live response on: a benign base64 blob or long token in the
+            # output would otherwise be blocked before reaching the caller.
+            concrete = bool(scan_result.pii_entities_response or scan_result.secret_types)
+            should_block = concrete and scan_result.security_risk_score >= 0.5
             result_dict = {
                 "response_blocked": should_block,
                 "risk_level":       scan_result.security_risk_level,
@@ -372,6 +436,7 @@ async def sync_security_check(message: Dict[str, Any]) -> None:
       - pii_ignore:       list[str]           (PII entity types to suppress)
     """
     correlation_id   = message.get("correlation_id")
+    org_id           = message.get("org_id")
     prompt           = message.get("prompt", "")
     policy           = message.get("policy") or {}
     block_threshold  = policy.get("block_threshold", "high")
@@ -435,7 +500,7 @@ async def sync_security_check(message: Dict[str, Any]) -> None:
 
     try:
         await kafka_producer.publish(
-            {"correlation_id": correlation_id, "result": result_dict},
+            {"correlation_id": correlation_id, "org_id": org_id, "result": result_dict},
             topic=config.KAFKA_SECURITY_REPLY_TOPIC,
         )
     except Exception:

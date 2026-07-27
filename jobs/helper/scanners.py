@@ -15,15 +15,23 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import List, Optional
 
-from jobs.helper.base import RiskLevel, _max_risk, _scan_patterns, _scan_tiered
+from jobs.helper.base import RiskLevel, _max_risk, _scan_patterns, _scan_tiered, normalize_text
 from jobs.helper.pii import _PIIScanner
-from jobs.helper.injection import INJECTION_COMPILED
+from jobs.helper.injection import (
+    INJECTION_COMPILED,
+    INJECTION_STRONG_COMPILED,
+    INJECTION_WEAK_COMPILED,
+)
 from jobs.helper.jailbreak import (
     JAILBREAK_COMPILED,
     JAILBREAK_STRONG_COMPILED,
     JAILBREAK_WEAK_COMPILED,
 )
-from jobs.helper.skeleton_key import SKELETON_KEY_COMPILED
+from jobs.helper.skeleton_key import (
+    SKELETON_KEY_COMPILED,
+    SKELETON_KEY_STRONG_COMPILED,
+    SKELETON_KEY_WEAK_COMPILED,
+)
 from jobs.helper.secrets import _SecretScanner
 from jobs.helper.semantic import init_semantic, semantic_score
 
@@ -39,6 +47,18 @@ init_semantic()
 # poisoned chunks are usually longer benign text wrapping a short injection, so
 # averaging dilutes the score and a slightly more sensitive threshold is needed.
 _RAG_POISON_THRESHOLD = 0.55
+
+# Per-field cap on text fed to the scanners. Presidio/spaCy and the
+# sentence-transformer are memory-heavy and this worker has OOM'd before; a
+# multi-MB trace field must not be handed to them whole. Attack markers live in
+# the first stretch of text, so truncation costs little detection power.
+_MAX_SCAN_CHARS = 100_000
+
+
+def _cap(text: str | None) -> str:
+    if not text:
+        return ""
+    return text if len(text) <= _MAX_SCAN_CHARS else text[:_MAX_SCAN_CHARS]
 
 
 # ── Public result types ───────────────────────────────────────────────────────
@@ -130,23 +150,35 @@ def scan(
     (e.g. ``["PERSON", "LOCATION"]``). Suppressed entities are dropped before
     scoring so they neither surface in the dashboard nor inflate risk.
     """
+    # Cap every text field before the memory-heavy scanners (OOM guard).
+    prompt       = _cap(prompt)
+    response     = _cap(response)
+    tool_outputs = [_cap(t) for t in (tool_outputs or [])]
+    context_docs = [_cap(c) for c in (context_docs or [])]
+    tool_inputs  = [_cap(t) for t in (tool_inputs or [])]
+
     # PII
     ignore       = set(pii_ignore or [])
     prompt_pii   = _pii_scanner.scan(prompt, ignore)
     response_pii = _pii_scanner.scan(response, ignore)
 
-    # Attack pattern scans (prompt only — response is attacker-unknown)
-    injection = _scan_patterns(prompt, INJECTION_COMPILED,  "injection")
+    # Attack pattern scans (prompt only — response is attacker-unknown).
+    # Tiered: an explicit ("strong") phrase is HIGH on its own; ambiguous
+    # ("weak") phrases need corroboration (one = LOW, two+ = MEDIUM) so benign
+    # steering ("from now on…", "make an exception") isn't a HIGH block.
+    injection = _scan_tiered(prompt, INJECTION_STRONG_COMPILED, INJECTION_WEAK_COMPILED, "injection")
     jailbreak = _scan_tiered(prompt, JAILBREAK_STRONG_COMPILED, JAILBREAK_WEAK_COMPILED, "jailbreak")
-    skeleton  = _scan_patterns(prompt, SKELETON_KEY_COMPILED, "skeleton_key")
+    skeleton  = _scan_tiered(prompt, SKELETON_KEY_STRONG_COMPILED, SKELETON_KEY_WEAK_COMPILED, "skeleton_key")
 
-    # Indirect injection: scan tool outputs and retrieved docs for attack patterns
+    # Indirect injection: scan tool outputs and retrieved docs for attack
+    # patterns, and — like retrieved docs — also semantically, so a paraphrased
+    # or obfuscated injection returned by a tool doesn't slip past the regex list.
     indirect_sources: list[str] = []
     for i, content in enumerate(tool_outputs or []):
         r = _scan_patterns(content, INJECTION_COMPILED, "indirect-tool")
         if not r.detected:
             r = _scan_patterns(content, JAILBREAK_COMPILED, "indirect-tool")
-        if r.detected:
+        if r.detected or semantic_score(content) >= _RAG_POISON_THRESHOLD:
             indirect_sources.append(f"tool_output[{i}]")
     for i, content in enumerate(context_docs or []):
         r = _scan_patterns(content, INJECTION_COMPILED, "indirect-doc")
@@ -173,9 +205,16 @@ def scan(
     for i, content in enumerate(tool_inputs or []):
         pii_hit    = _pii_scanner.scan(content, ignore)
         secret_hit = _secret_scanner.scan(content)
-        if pii_hit.entities or secret_hit.detected:
+        # Also scan a normalized copy: a secret laced with zero-width chars
+        # ("sk-proj<zwsp>-…") evades the raw regex, but the receiving tool may
+        # strip them and reconstruct the credential. Detection only (OR-ed) —
+        # redaction still keys off the raw text's offsets.
+        norm = normalize_text(content)
+        norm_secret = _secret_scanner.scan(norm) if norm != content else secret_hit
+        if pii_hit.entities or secret_hit.detected or norm_secret.detected:
             exfil_types.update(pii_hit.entities)
             exfil_types.update(secret_hit.secret_types)
+            exfil_types.update(norm_secret.secret_types)
             exfil_sources.append(f"tool_input[{i}]")
 
     # Tool-allowlist policy (B.3): when the org configured an allowlist, any
@@ -196,6 +235,11 @@ def scan(
     prompt_secrets   = _secret_scanner.scan(prompt)
     all_secret_types = list(set(response_secrets.secret_types + prompt_secrets.secret_types))
     secrets_detected = response_secrets.detected or prompt_secrets.detected
+    # A NAMED secret pattern (openai_key, aws_access_key, …) is HIGH → 1.0. A
+    # high-entropy-only hit is a soft MEDIUM signal → 0.5: a benign base64 blob
+    # must not score 1.0 (which maps to HIGH in the run-rollup badge) while the
+    # actual risk_level is only MEDIUM.
+    secret_score = 1.0 if all_secret_types else (0.5 if secrets_detected else 0.0)
 
     # Image-embedded injection: OCR'd image text (label, text) run through the
     # same injection / jailbreak / skeleton-key scanners as the prompt.
@@ -254,7 +298,7 @@ def scan(
         1.0 if cross_agent_injection else 0.0,
         1.0 if image_injection_sources else 0.0,
         sem_score,
-        1.0 if secrets_detected else 0.0,
+        secret_score,
     )
 
     return ScanResult(
@@ -292,9 +336,9 @@ def scan(
 
 def check(prompt: str) -> CheckResult:
     """Lightweight pre-call check: attack patterns only, no PII or secrets scan."""
-    injection = _scan_patterns(prompt, INJECTION_COMPILED,    "injection")
+    injection = _scan_tiered(prompt, INJECTION_STRONG_COMPILED, INJECTION_WEAK_COMPILED, "injection")
     jailbreak = _scan_tiered(prompt, JAILBREAK_STRONG_COMPILED, JAILBREAK_WEAK_COMPILED, "jailbreak")
-    skeleton  = _scan_patterns(prompt, SKELETON_KEY_COMPILED, "skeleton_key")
+    skeleton  = _scan_tiered(prompt, SKELETON_KEY_STRONG_COMPILED, SKELETON_KEY_WEAK_COMPILED, "skeleton_key")
     sem_score = semantic_score(prompt)
 
     attack_types: list[str] = []

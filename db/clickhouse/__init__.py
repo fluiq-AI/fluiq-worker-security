@@ -72,23 +72,30 @@ class ClickHouseSecurityClient:
         exclude_trace_id: Any,
         table: Optional[str] = None,
     ) -> list[float]:
-        """Return ordered security_risk_score values for the session, excluding the current trace."""
+        """Return ordered security_risk_score values for the session, excluding the current trace.
+
+        Takes the MOST RECENT 19 turns (DESC + re-sort ascending), not the
+        oldest: the crescendo slope must reflect the current trajectory, so a
+        slow-burn attack that ramps late in a long session isn't diluted by
+        stale early turns.
+        """
         if self._client is None:
             await self.start()
         target = table or self.default_table
         result = await self._client.query(
-            f"SELECT security_risk_score FROM {target} "
+            f"SELECT security_risk_score, ingested_at FROM {target} "
             f"WHERE organization_id = {{org_id:UUID}} "
             f"AND root_trace_id = {{root_id:UUID}} "
             f"AND trace_id != {{exc_id:UUID}} "
-            f"ORDER BY ingested_at ASC LIMIT 19",
+            f"ORDER BY ingested_at DESC LIMIT 19",
             parameters={
                 "org_id": str(organization_id),
                 "root_id": str(root_trace_id),
                 "exc_id": str(exclude_trace_id),
             },
         )
-        return [float(row[0]) for row in result.result_rows]
+        rows = sorted(result.result_rows, key=lambda r: r[1])  # oldest → newest
+        return [float(row[0]) for row in rows]
 
     async def get_indirect_sources(
         self,
@@ -312,6 +319,9 @@ class ClickHouseSecurityClient:
                 int(bool(record.get("should_block"))),
                 float(record.get("scan_latency") or 0.0),
                 record.get("extra") or {},
+                # Per-row retention (mirrors traces); "never" sentinel when the
+                # ingest path didn't forward one, so a scan is never dropped early.
+                int(record.get("retention_days") or 36500),
             ]],
             column_names=[
                 "organization_id", "api_key_prefix", "trace_id", "root_trace_id",
@@ -329,6 +339,7 @@ class ClickHouseSecurityClient:
                 "image_injection_detected", "image_injection_sources",
                 "semantic_attack_score", "security_risk_level",
                 "security_risk_score", "should_block", "scan_latency", "extra",
+                "retention_days",
             ],
         )
 

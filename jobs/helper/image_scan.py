@@ -17,8 +17,11 @@ payloads aren't stored in the trace.
 from __future__ import annotations
 
 import base64
+import ipaddress
 import logging
+import socket
 from typing import Any, Callable, Dict, List, Optional, Tuple
+from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)
 
@@ -26,6 +29,46 @@ OcrFn = Callable[[bytes, Optional[str]], str]
 
 _MAX_IMAGES = 6
 _MAX_BYTES = 8 * 1024 * 1024  # don't fetch/decode absurdly large images
+# Decompression-bomb guard: reject images whose decoded pixel count exceeds this.
+# A small compressed file can decode to gigapixels and OOM the worker during OCR.
+_MAX_PIXELS = 40_000_000  # ~40MP
+
+
+def _is_public_http_url(url: str) -> bool:
+    """True only if ``url`` is http(s) and every resolved IP is public.
+
+    SSRF guard: image URLs arrive on untrusted trace events and are fetched
+    server-side from inside the VPC. Without this a URL like
+    ``http://169.254.169.254/…`` (cloud metadata) or an internal host would be
+    fetched. Resolution failures reject by default. Callers must also disable
+    redirect following (a redirect could hop to an internal host).
+    """
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return False
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        return False
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    try:
+        infos = socket.getaddrinfo(parsed.hostname, port, proto=socket.IPPROTO_TCP)
+    except Exception:
+        return False
+    if not infos:
+        return False
+    for info in infos:
+        try:
+            addr = ipaddress.ip_address(info[4][0])
+        except ValueError:
+            return False
+        # Unwrap IPv4-mapped IPv6 (::ffff:127.0.0.1) so a private v4 can't hide.
+        mapped = getattr(addr, "ipv4_mapped", None)
+        if mapped is not None:
+            addr = mapped
+        if (addr.is_private or addr.is_loopback or addr.is_link_local
+                or addr.is_multicast or addr.is_reserved or addr.is_unspecified):
+            return False
+    return True
 
 
 # ── media extraction (URL or inline data) ────────────────────────────────────
@@ -90,8 +133,15 @@ def _load_default_ocr() -> Optional[OcrFn]:
         import pytesseract
         from PIL import Image
 
+        # Cap decoded pixels — PIL raises DecompressionBombError past ~2x this,
+        # which the caller's try/except turns into a skipped image.
+        Image.MAX_IMAGE_PIXELS = _MAX_PIXELS
+
         def _tess(data: bytes, mime: Optional[str]) -> str:
-            return pytesseract.image_to_string(Image.open(io.BytesIO(data))) or ""
+            img = Image.open(io.BytesIO(data))
+            if img.width * img.height > _MAX_PIXELS:
+                return ""
+            return pytesseract.image_to_string(img) or ""
 
         _default_ocr = _tess
         logger.info("[SECURITY] image OCR backend: pytesseract")
@@ -106,9 +156,13 @@ def _load_default_ocr() -> Optional[OcrFn]:
         from PIL import Image
 
         reader = easyocr.Reader(["en"], gpu=False)
+        Image.MAX_IMAGE_PIXELS = _MAX_PIXELS
 
         def _easy(data: bytes, mime: Optional[str]) -> str:
-            img = np.array(Image.open(io.BytesIO(data)).convert("RGB"))
+            pil = Image.open(io.BytesIO(data))
+            if pil.width * pil.height > _MAX_PIXELS:
+                return ""
+            img = np.array(pil.convert("RGB"))
             return "\n".join(reader.readtext(img, detail=0) or [])
 
         _default_ocr = _easy
@@ -128,10 +182,16 @@ def _image_bytes(item: Dict[str, Any]) -> Optional[bytes]:
             return None
     url = item.get("url")
     if isinstance(url, str) and url.startswith(("http://", "https://")):
+        # SSRF guard: reject private/loopback/link-local/metadata hosts, and
+        # never follow redirects (a 3xx could hop to an internal host).
+        if not _is_public_http_url(url):
+            logger.warning("[SECURITY] Refusing to fetch image from non-public URL")
+            return None
         try:
             import requests
-            resp = requests.get(url, timeout=8, stream=True)
-            resp.raise_for_status()
+            resp = requests.get(url, timeout=8, stream=True, allow_redirects=False)
+            if resp.status_code != 200:
+                return None
             data = resp.raw.read(_MAX_BYTES + 1)
             return data if data and len(data) <= _MAX_BYTES else None
         except Exception:

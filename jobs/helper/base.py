@@ -2,11 +2,43 @@ from __future__ import annotations
 
 import logging
 import re
+import unicodedata
 from dataclasses import dataclass
 from enum import Enum
 from typing import List
 
 logger = logging.getLogger(__name__)
+
+# Zero-width / invisible characters an attacker can splice into a phrase to break
+# literal pattern matching ("ig<zwsp>nore previous instructions") while the model
+# still reads it normally. Stripped before attack-pattern matching.
+_ZERO_WIDTH_RE = re.compile(
+    "[​‌‍⁠﻿᠎­͏؜"
+    "ᅟᅠ឴឵ㅤﾠ‎‏]"
+)
+# Other Unicode format/control characters (category Cf/Cc) except tab/newline.
+_FORMAT_CTRL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+
+
+def normalize_text(text: str) -> str:
+    """Fold Unicode evasion tricks before attack-pattern / semantic matching.
+
+    NFKC collapses full-width and compatibility homoglyphs to their ASCII form,
+    then zero-width and control characters are removed, and finally runs of
+    whitespace (spaces, tabs, newlines) are collapsed to a single space so an
+    attacker cannot defeat the multi-word literal patterns by padding the gaps
+    ("pretend   you   are", or a phrase split across newlines). Case is left
+    alone (the scanners match case-insensitively). Only used for attack
+    detection — never for PII/secrets, whose recognizers are offset- and
+    exact-format sensitive.
+    """
+    if not text:
+        return text
+    text = unicodedata.normalize("NFKC", text)
+    text = _ZERO_WIDTH_RE.sub("", text)
+    text = _FORMAT_CTRL_RE.sub("", text)
+    text = re.sub(r"\s+", " ", text)
+    return text
 
 
 class RiskLevel(str, Enum):
@@ -80,6 +112,7 @@ def _scan_patterns(
     if not text or not text.strip():
         return empty
     try:
+        text = normalize_text(text)
         found = [p for p, rx in compiled if rx.search(text)]
         if not found:
             return empty
@@ -105,6 +138,7 @@ def _scan_tiered(
     if not text or not text.strip():
         return empty
     try:
+        text = normalize_text(text)
         strong_hits = [p for p, rx in strong if rx.search(text)]
         weak_hits = [p for p, rx in weak if rx.search(text)]
         found = strong_hits + weak_hits
