@@ -41,6 +41,11 @@ from jobs.helper.semantic import init_semantic, semantic_score
 # distribution against _RAG_POISON_THRESHOLD and were not part of that
 # calibration — changing them here would be an unmeasured behaviour change.
 from jobs.helper.semantic_v2 import semantic_verdict
+# Classifier runs in scan() only, never in check(). A DeBERTa forward pass costs
+# roughly 500ms against sub-millisecond for the embedding scopes, and check() is
+# the synchronous pre-call gate a caller waits on. scan() is post-call and
+# already off the request path.
+from jobs.helper.classifier import classifier_verdict
 
 
 # ── Module-level singletons ───────────────────────────────────────────────────
@@ -114,6 +119,10 @@ class ScanResult:
     image_injection_sources:  List[str]
     # Semantic
     semantic_attack_score: float
+    # Independent injection classifier. Advisory by default: recorded so the
+    # disagreements with the shipping gate can be mined for training labels,
+    # but it does not contribute to should_block unless MODE=block.
+    classifier_score:      float
     # Aggregate
     security_risk_level:   str
     security_risk_score:   float
@@ -273,6 +282,15 @@ def scan(
     # so in practice it almost never fired and patterns carried the whole load.
     sem_detected, sem_scope, sem_score = semantic_verdict(prompt)
 
+    # Third signal. In advisory mode (the default) this contributes the score
+    # but never the verdict: the model is strong on public corpora and flags a
+    # third of production-like benign prompts, so it earns its place as a
+    # recorded opinion and a source of training labels, not as a blocker.
+    clf_detected, clf_score = classifier_verdict(prompt)
+    if clf_detected:
+        sem_detected = True
+        sem_scope = sem_scope or "classifier"
+
     # Cross-agent injection (C.1): the inbound prompt came from another agent's
     # output (not the end user) AND carries attack content — a multi-agent trust
     # violation where one agent injects into another. Tool-sourced injection is
@@ -349,6 +367,7 @@ def scan(
         image_injection_detected    = bool(image_injection_sources),
         image_injection_sources     = image_injection_sources,
         semantic_attack_score       = round(sem_score, 4),
+        classifier_score            = round(clf_score, 4),
         security_risk_level         = overall_risk.value,
         security_risk_score         = round(risk_score, 4),
         should_block                = overall_risk == RiskLevel.HIGH,

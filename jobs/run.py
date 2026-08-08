@@ -1,3 +1,4 @@
+import os
 import asyncio
 import logging
 import time
@@ -12,6 +13,12 @@ from db.clickhouse import clickhouse_security_client
 from db.kafka import kafka_producer
 
 logger = logging.getLogger(__name__)
+
+# Mirrors the lower of the two scope thresholds in semantic_v2. Kept as a named
+# constant rather than a literal so it cannot drift out of step again.
+SEMANTIC_REPORT_THRESHOLD = float(
+    os.getenv("FLUIQ_SEMANTIC_REPORT_THRESHOLD", "0.34")
+)
 
 _RISK_SCORE_MAP = {"clean": 0.0, "low": 0.25, "medium": 0.5, "high": 1.0}
 
@@ -456,7 +463,12 @@ async def sync_security_check(message: Dict[str, Any]) -> None:
                 attack_types.append("jailbreak")
             if scan_result.skeleton_key_detected:
                 attack_types.append("skeleton_key")
-            if scan_result.semantic_attack_score >= 0.65:
+            # scanners.scan() already applied each scope's own threshold and
+            # recorded the outcome; re-deriving it from a single 0.65 constant
+            # here would silently disagree with the gate that actually ran.
+            # 0.65 sat above nearly every real score, so this branch was almost
+            # never taken even when the scan had flagged the prompt.
+            if scan_result.semantic_attack_score >= SEMANTIC_REPORT_THRESHOLD:
                 attack_types.append("semantic_attack")
             if scan_result.pii_entities_prompt:
                 attack_types.append("pii_detected")

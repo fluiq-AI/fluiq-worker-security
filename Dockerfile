@@ -37,6 +37,15 @@ RUN python -c "from sentence_transformers import SentenceTransformer; \
     SentenceTransformer('all-MiniLM-L6-v2'); \
     SentenceTransformer('paraphrase-multilingual-MiniLM-L12-v2')"
 
+# Injection classifier (~740MB on disk, ~440MB resident). Advisory-only, and it
+# runs in scan() but never in the synchronous check() path. Baked for the same
+# reason as the encoders: a lazy fetch puts the download inside the first
+# message after a deploy.
+RUN python -c "from transformers import AutoModelForSequenceClassification, AutoTokenizer; \
+    m='protectai/deberta-v3-base-prompt-injection-v2'; \
+    AutoTokenizer.from_pretrained(m); \
+    AutoModelForSequenceClassification.from_pretrained(m)"
+
 COPY . .
 
 CMD ["python", "-m", "app"]
