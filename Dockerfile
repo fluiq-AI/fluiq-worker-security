@@ -23,6 +23,20 @@ RUN pip install --no-cache-dir -r requirements.txt
 # evaluator's detection behavior; swap to en_core_web_sm to cut ~700MB RSS.
 RUN python -m spacy download en_core_web_lg
 
+# Bake the sentence-transformer encoders into the image. These were previously
+# fetched lazily on first use, which put a multi-hundred-MB download inside the
+# request path — a cold task looked like a hang rather than a slow start.
+#
+#   all-MiniLM-L6-v2                     jailbreak scope   (~90MB)
+#   paraphrase-multilingual-MiniLM-L12-v2 injection scope  (~470MB)
+#
+# Two encoders because the scopes want different things: roughly a third of real
+# injection traffic is not English, while the jailbreak corpus is English-only
+# and the monolingual model is stronger per-language there.
+RUN python -c "from sentence_transformers import SentenceTransformer; \
+    SentenceTransformer('all-MiniLM-L6-v2'); \
+    SentenceTransformer('paraphrase-multilingual-MiniLM-L12-v2')"
+
 COPY . .
 
 CMD ["python", "-m", "app"]
