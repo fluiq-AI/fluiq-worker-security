@@ -12,6 +12,7 @@ Individual scanners live in their own modules:
 """
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from typing import List, Optional
 
@@ -34,6 +35,12 @@ from jobs.helper.skeleton_key import (
 )
 from jobs.helper.secrets import _SecretScanner
 from jobs.helper.semantic import init_semantic, semantic_score
+# Prompt-side semantic scoring moved to the two-scope module: injection and
+# jailbreak get their own encoder, seed set and threshold. `semantic_score` is
+# kept for the retrieved-document paths below, which are scored on a different
+# distribution against _RAG_POISON_THRESHOLD and were not part of that
+# calibration — changing them here would be an unmeasured behaviour change.
+from jobs.helper.semantic_v2 import semantic_verdict
 
 
 # ── Module-level singletons ───────────────────────────────────────────────────
@@ -43,9 +50,15 @@ _secret_scanner = _SecretScanner()
 init_semantic()
 
 # A retrieved document whose semantic similarity to the attack centroid meets
-# this bar is treated as RAG poisoning. Lower than the prompt-side bar (0.65):
-# poisoned chunks are usually longer benign text wrapping a short injection, so
-# averaging dilutes the score and a slightly more sensitive threshold is needed.
+# this bar is treated as RAG poisoning. Poisoned chunks are usually longer benign
+# text wrapping a short injection, so averaging dilutes the score and a more
+# sensitive threshold is needed.
+#
+# This is still scored by the original single-centroid `semantic_score`, on a
+# different distribution from the prompt-side scopes, and it was NOT part of the
+# calibration that produced those thresholds. It has never been measured against
+# a document corpus, so it is left exactly as it was. Re-tuning it needs its own
+# benchmark, not an assumption that a prompt-side number transfers.
 _RAG_POISON_THRESHOLD = 0.55
 
 # Per-field cap on text fed to the scanners. Presidio/spaCy and the
@@ -253,15 +266,19 @@ def scan(
         if r.detected:
             image_injection_sources.append(label)
 
-    # Semantic
-    sem_score = semantic_score(prompt)
+    # Semantic. Each scope carries its own threshold, so the verdict is taken
+    # from semantic_verdict() rather than by comparing a single blended score
+    # against one constant. The old `>= 0.65` gate sat well above the useful
+    # operating range (0.15-0.44 measured on public injection/jailbreak corpora),
+    # so in practice it almost never fired and patterns carried the whole load.
+    sem_detected, sem_scope, sem_score = semantic_verdict(prompt)
 
     # Cross-agent injection (C.1): the inbound prompt came from another agent's
     # output (not the end user) AND carries attack content — a multi-agent trust
     # violation where one agent injects into another. Tool-sourced injection is
     # covered separately by indirect injection, so only agent-to-agent counts.
     cross_agent_injection = cross_agent_source and (
-        injection.detected or jailbreak.detected or sem_score >= 0.65
+        injection.detected or jailbreak.detected or sem_detected
     )
 
     # Aggregate risk
@@ -275,7 +292,11 @@ def scan(
         RiskLevel.HIGH   if policy_violations   else RiskLevel.CLEAN,
         RiskLevel.HIGH   if cross_agent_injection else RiskLevel.CLEAN,
         RiskLevel.HIGH   if image_injection_sources else RiskLevel.CLEAN,
-        RiskLevel.MEDIUM if sem_score >= 0.65   else RiskLevel.CLEAN,
+        # HIGH, not MEDIUM, for the same reason as in check(): should_block is
+        # `overall_risk == HIGH`, so a MEDIUM semantic hit could never block no
+        # matter how confident. Same env kill switch, so both paths agree.
+        ((RiskLevel.HIGH if os.getenv("FLUIQ_SEMANTIC_BLOCKS", "1") != "0"
+          else RiskLevel.MEDIUM) if sem_detected else RiskLevel.CLEAN),
     )
     overall_risk = _max_risk(
         prompt_pii.risk_level,
@@ -339,7 +360,7 @@ def check(prompt: str) -> CheckResult:
     injection = _scan_tiered(prompt, INJECTION_STRONG_COMPILED, INJECTION_WEAK_COMPILED, "injection")
     jailbreak = _scan_tiered(prompt, JAILBREAK_STRONG_COMPILED, JAILBREAK_WEAK_COMPILED, "jailbreak")
     skeleton  = _scan_tiered(prompt, SKELETON_KEY_STRONG_COMPILED, SKELETON_KEY_WEAK_COMPILED, "skeleton_key")
-    sem_score = semantic_score(prompt)
+    sem_detected, sem_scope, sem_score = semantic_verdict(prompt)
 
     attack_types: list[str] = []
     if injection.detected:
@@ -348,14 +369,25 @@ def check(prompt: str) -> CheckResult:
         attack_types.append("jailbreak")
     if skeleton.detected:
         attack_types.append("skeleton_key")
-    if sem_score >= 0.65:
-        attack_types.append("semantic_attack")
+    if sem_detected:
+        attack_types.append(f"semantic_{sem_scope}" if sem_scope else "semantic_attack")
 
+    # A semantic hit is HIGH here, not MEDIUM. Previously it was MEDIUM, and
+    # since `allow` is `overall != HIGH`, that meant the semantic layer could
+    # never block on this path no matter how confident it was — patterns were
+    # the only thing that could ever say no.
+    #
+    # Measured on held-out public corpora, promoting it takes combined recall
+    # from 30.0% to 58.8% for a false-alarm rate of 4.2% (patterns alone: 2.6%).
+    # Set FLUIQ_SEMANTIC_BLOCKS=0 to restore the advisory-only behaviour without
+    # losing the score, which is still reported either way.
+    _sem_blocks = os.getenv("FLUIQ_SEMANTIC_BLOCKS", "1") != "0"
     overall = _max_risk(
         injection.risk_level,
         jailbreak.risk_level,
         skeleton.risk_level,
-        RiskLevel.MEDIUM if sem_score >= 0.65 else RiskLevel.CLEAN,
+        (RiskLevel.HIGH if _sem_blocks else RiskLevel.MEDIUM)
+        if sem_detected else RiskLevel.CLEAN,
     )
     allow = overall != RiskLevel.HIGH
 
